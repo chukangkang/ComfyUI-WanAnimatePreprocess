@@ -15,7 +15,13 @@ class SimpleOnnxInference(object):
         provider = [device, 'CPUExecutionProvider'] if device == 'CUDAExecutionProvider' else [device]
 
         self.provider = provider
-        self.session = onnxruntime.InferenceSession(checkpoint, providers=provider)
+        # 优化：启用所有图优化和内存优化
+        sess_options = onnxruntime.SessionOptions()
+        sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = 8
+        sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+        
+        self.session = onnxruntime.InferenceSession(checkpoint, sess_options=sess_options, providers=provider)
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
         self.input_resolution = self.session.get_inputs()[0].shape[2:]
@@ -43,7 +49,12 @@ class SimpleOnnxInference(object):
 
         if self.session is None:
             checkpoint = self.checkpoint
-            self.session = onnxruntime.InferenceSession(checkpoint, providers=self.provider)
+            sess_options = onnxruntime.SessionOptions()
+            sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_options.intra_op_num_threads = 8
+            sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+            
+            self.session = onnxruntime.InferenceSession(checkpoint, sess_options=sess_options, providers=self.provider)
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
             self.input_resolution = self.session.get_inputs()[0].shape[2:]
@@ -252,14 +263,15 @@ class Yolo(SimpleOnnxInference):
     def forward(self, img, shape_raw, **kwargs):
         """
         Performs inference using an ONNX model and returns the output image with drawn detections.
-
-        Returns:
-            output_img: The output image with drawn detections.
+        优化：支持批量推理
         """
         if isinstance(img, torch.Tensor):
             img = img.cpu().numpy()
             shape_raw = shape_raw.cpu().numpy()
 
+        # 确保输入是连续内存的 numpy 数组以提高推理速度
+        img = np.ascontiguousarray(img)
+        
         outputs = self.session.run(None, {self.session.get_inputs()[0].name: img})[0]
         person_results = [[{'bbox': np.array([0., 0., 1.*shape_raw[i][1], 1.*shape_raw[i][0], -1]), 'track_id': -1}] for i in range(len(outputs))]
 
@@ -273,6 +285,10 @@ class ViTPose(SimpleOnnxInference):
         super(ViTPose, self).__init__(checkpoint, device=device)
 
     def forward(self, img, center, scale, **kwargs):
+        # 优化：确保输入是连续内存，支持批量推理
+        img = np.ascontiguousarray(img)
+        
+        # 批量推理
         heatmaps = self.session.run([], {self.session.get_inputs()[0].name: img})[0]
         points, prob = keypoints_from_heatmaps(heatmaps=heatmaps,
                                             center=center,

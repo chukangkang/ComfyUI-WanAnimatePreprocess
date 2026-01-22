@@ -6,6 +6,8 @@ import folder_paths
 import cv2
 import json
 import logging
+from queue import Queue
+from threading import Thread
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 from comfy import model_management as mm
@@ -111,35 +113,80 @@ class PoseAndFaceDetection:
 
         comfy_pbar = ProgressBar(B*2)
         progress = 0
+        
+        # 批量处理 bbox 检测 (优化：批量预处理)
+        batch_size = max(8, min(16, B // 4))  # 动态批量大小
         bboxes = []
-        for img in tqdm(images_np, total=len(images_np), desc="Detecting bboxes"):
-            bboxes.append(detector(
-                cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
-                shape
-                )[0][0]["bbox"])
-            progress += 1
-            if progress % 10 == 0:
-                comfy_pbar.update_absolute(progress)
+        
+        def preprocess_bbox_batch(image_batch):
+            """预处理图像批次"""
+            resized_batch = np.array([cv2.resize(img, (640, 640)) for img in image_batch])
+            transposed_batch = resized_batch.transpose(0, 3, 1, 2).astype(np.float32)
+            return transposed_batch
+        
+        # 批量检测 bboxes
+        for batch_start in tqdm(range(0, len(images_np), batch_size), total=(len(images_np) + batch_size - 1) // batch_size, desc="Detecting bboxes"):
+            batch_end = min(batch_start + batch_size, len(images_np))
+            image_batch = images_np[batch_start:batch_end]
+            
+            # 批量预处理
+            processed_batch = preprocess_bbox_batch(image_batch)
+            
+            # 批量推理
+            results = detector(processed_batch, np.tile(shape, (len(image_batch), 1)))
+            
+            # 提取结果
+            for result in results:
+                bboxes.append(result[0]["bbox"])
+            
+            progress += len(image_batch)
+            comfy_pbar.update_absolute(min(progress, B))
 
         detector.cleanup()
 
+        # 批量处理关键点提取 (优化：批量预处理 + 批量推理)
         kp2ds = []
-        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="Extracting keypoints"):
-            if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10 or (bbox[3] - bbox[1]) < 10:
-                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
-
-            bbox_xywh = bbox
-            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
-            img = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
-
-            img_norm = (img - IMG_NORM_MEAN) / IMG_NORM_STD
-            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
-
-            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
-            kp2ds.append(keypoints)
-            progress += 1
-            if progress % 10 == 0:
-                comfy_pbar.update_absolute(progress)
+        
+        def preprocess_keypoint_batch(image_batch, bbox_batch):
+            """预处理关键点批次，包括 crop 和 normalize"""
+            processed_imgs = []
+            centers = []
+            scales = []
+            
+            for img, bbox in zip(image_batch, bbox_batch):
+                if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10 or (bbox[3] - bbox[1]) < 10:
+                    bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+                
+                center, scale = bbox_from_detector(bbox, input_resolution, rescale=rescale)
+                cropped_img = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+                
+                img_norm = (cropped_img - IMG_NORM_MEAN) / IMG_NORM_STD
+                img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+                
+                processed_imgs.append(img_norm)
+                centers.append(center)
+                scales.append(scale)
+            
+            return np.array(processed_imgs), np.array(centers), np.array(scales)
+        
+        # 批量提取关键点
+        for batch_start in tqdm(range(0, len(images_np), batch_size), total=(len(images_np) + batch_size - 1) // batch_size, desc="Extracting keypoints"):
+            batch_end = min(batch_start + batch_size, len(images_np))
+            image_batch = images_np[batch_start:batch_end]
+            bbox_batch = bboxes[batch_start:batch_end]
+            
+            # 批量预处理
+            processed_imgs, centers, scales = preprocess_keypoint_batch(image_batch, bbox_batch)
+            
+            # 批量推理
+            keypoints_batch = pose_model(processed_imgs, centers, scales)
+            
+            # 添加结果
+            for keypoints in keypoints_batch:
+                kp2ds.append(keypoints)
+            
+            progress += len(image_batch)
+            comfy_pbar.update_absolute(B + min(progress, B))
 
         pose_model.cleanup()
 
@@ -405,35 +452,80 @@ class PoseDetectionOneToAllAnimation:
 
         comfy_pbar = ProgressBar(B*2)
         progress = 0
+        
+        # 批量处理 bbox 检测 (优化：批量预处理)
+        batch_size = max(8, min(16, B // 4))  # 动态批量大小
         bboxes = []
-        for img in tqdm(images_np, total=len(images_np), desc="Detecting bboxes"):
-            bboxes.append(detector(
-                cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
-                shape
-                )[0][0]["bbox"])
-            progress += 1
-            if progress % 10 == 0:
-                comfy_pbar.update_absolute(progress)
+        
+        def preprocess_bbox_batch(image_batch):
+            """预处理图像批次"""
+            resized_batch = np.array([cv2.resize(img, (640, 640)) for img in image_batch])
+            transposed_batch = resized_batch.transpose(0, 3, 1, 2).astype(np.float32)
+            return transposed_batch
+        
+        # 批量检测 bboxes
+        for batch_start in tqdm(range(0, len(images_np), batch_size), total=(len(images_np) + batch_size - 1) // batch_size, desc="Detecting bboxes"):
+            batch_end = min(batch_start + batch_size, len(images_np))
+            image_batch = images_np[batch_start:batch_end]
+            
+            # 批量预处理
+            processed_batch = preprocess_bbox_batch(image_batch)
+            
+            # 批量推理
+            results = detector(processed_batch, np.tile(shape, (len(image_batch), 1)))
+            
+            # 提取结果
+            for result in results:
+                bboxes.append(result[0]["bbox"])
+            
+            progress += len(image_batch)
+            comfy_pbar.update_absolute(min(progress, B))
 
         detector.cleanup()
 
+        # 批量处理关键点提取 (优化：批量预处理 + 批量推理)
         kp2ds = []
-        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="Extracting keypoints"):
-            if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10 or (bbox[3] - bbox[1]) < 10:
-                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
-
-            bbox_xywh = bbox
-            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
-            img = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
-
-            img_norm = (img - IMG_NORM_MEAN) / IMG_NORM_STD
-            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
-
-            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
-            kp2ds.append(keypoints)
-            progress += 1
-            if progress % 10 == 0:
-                comfy_pbar.update_absolute(progress)
+        
+        def preprocess_keypoint_batch(image_batch, bbox_batch):
+            """预处理关键点批次，包括 crop 和 normalize"""
+            processed_imgs = []
+            centers = []
+            scales = []
+            
+            for img, bbox in zip(image_batch, bbox_batch):
+                if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10 or (bbox[3] - bbox[1]) < 10:
+                    bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+                
+                center, scale = bbox_from_detector(bbox, input_resolution, rescale=rescale)
+                cropped_img = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+                
+                img_norm = (cropped_img - IMG_NORM_MEAN) / IMG_NORM_STD
+                img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+                
+                processed_imgs.append(img_norm)
+                centers.append(center)
+                scales.append(scale)
+            
+            return np.array(processed_imgs), np.array(centers), np.array(scales)
+        
+        # 批量提取关键点
+        for batch_start in tqdm(range(0, len(images_np), batch_size), total=(len(images_np) + batch_size - 1) // batch_size, desc="Extracting keypoints"):
+            batch_end = min(batch_start + batch_size, len(images_np))
+            image_batch = images_np[batch_start:batch_end]
+            bbox_batch = bboxes[batch_start:batch_end]
+            
+            # 批量预处理
+            processed_imgs, centers, scales = preprocess_keypoint_batch(image_batch, bbox_batch)
+            
+            # 批量推理
+            keypoints_batch = pose_model(processed_imgs, centers, scales)
+            
+            # 添加结果
+            for keypoints in keypoints_batch:
+                kp2ds.append(keypoints)
+            
+            progress += len(image_batch)
+            comfy_pbar.update_absolute(B + min(progress, B))
 
         pose_model.cleanup()
 
